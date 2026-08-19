@@ -1,7 +1,8 @@
 -------------------------------------------------------------------------------
 -- Company    : SLAC National Accelerator Laboratory
 -------------------------------------------------------------------------------
--- Description: Wrapper for simple BRAM based frame buffer with AXI Stream interface
+-- Description: Wrapper for BRAM based frame buffer with AXI Stream interface.
+-- Optionally supports memory segments for keeping multiple frames.
 -------------------------------------------------------------------------------
 -- This file is part of 'SLAC Firmware Standard Library'.
 -- It is subject to the license terms in the LICENSE.txt file found in the
@@ -77,6 +78,8 @@ entity AxiStreamFrameBuffer is
       COMMON_CLK_G        : boolean                := false;  -- true if dataClk=axilClk
       DATA_BYTES_G        : positive               := 16;
       RAM_ADDR_WIDTH_G    : positive range 1 to 32 := 9;
+      SEGS_EN_G           : boolean                := true;  -- TODO: default to false
+      SEGS_ADDR_WIDTH_G   : positive range 1 to 8  := 1;
       -- AXI Stream Configurations
       INT_PIPE_STAGES_G   : natural                := 1;
       PIPE_STAGES_G       : natural                := 1;
@@ -90,12 +93,15 @@ entity AxiStreamFrameBuffer is
       dataRst         : in  sl := '0';
       dataValid       : in  sl := '1';
       dataValue       : in  slv(8*DATA_BYTES_G-1 downto 0);
+      -- TODO: Decide how to handle invalid segment number
+      dataSeg         : in  slv(SEGS_ADDR_WIDTH_G-1 downto 0);
       dataFrameTxLast : in  sl := '0';  -- Signal end of frame
       dataFrameRxDone : out sl := '0';  -- Asserted on end of frame (due to dataFrameTxLast or buffer full)
       dataRdTrig      : in  sl;  -- Readout trigger synchronous to dataClk
       -- AXI-Lite interface (axilClk domain)
       axilClk         : in  sl;
       axilRst         : in  sl;
+      axilSeg         : in  slv(SEGS_ADDR_WIDTH_G-1 downto 0);
       axilReadMaster  : in  AxiLiteReadMasterType;
       axilReadSlave   : out AxiLiteReadSlaveType;
       axilWriteMaster : in  AxiLiteWriteMasterType;
@@ -123,7 +129,21 @@ architecture rtl of AxiStreamFrameBuffer is
       if SAFE_BUFFS_G then return 3; else return 1; end if;
    end function;
 
-   constant N_BUFFS_C : integer := get_n_buffs;
+   function get_n_segs return integer is
+   begin
+      if SEGS_EN_G then return 2**SEGS_ADDR_WIDTH_G; else return 0; end if;
+   end function get_n_segs;
+
+   function get_ram_addr_width return integer is
+   begin
+      if SEGS_EN_G then return RAM_ADDR_WIDTH_G + SEGS_ADDR_WIDTH_G; else return RAM_ADDR_WIDTH_G; end if;
+   end function get_ram_addr_width;
+
+   -- Must use the conditional constant values instead of generics directly
+   -- in code below where required!
+   constant N_BUFFS_C        : integer := get_n_buffs;
+   constant N_SEGS_C         : integer := get_n_segs;
+   constant RAM_ADDR_WIDTH_C : integer := get_ram_addr_width;
 
    ------------------------------
    -- Stream clock domain signals
@@ -136,36 +156,52 @@ architecture rtl of AxiStreamFrameBuffer is
       IDLE_S,
       WAIT_S);
 
+   -- Registers required separately for each segment
+   -- TODO: Might be more efficient to at least store the final addresses in a RAM?
+   type SegRegType is record
+      -- TODO: At least one of thre three is redundant...
+      ramWrEnMask     : slv(2 downto 0);  -- Which ram to write to
+      ramRdEnMask     : slv(2 downto 0);  -- Which ram allocated to reading right now
+      ramRdEnMaskNext : slv(2 downto 0);  -- Which ram to read from on next request
+      rdFinalAddrNext : slv(RAM_ADDR_WIDTH_G-1 downto 0);  -- How much data is valid
+   end record;
+
+   constant SEG_REG_INIT_C : SegRegType := (
+      ramWrEnMask     => "001",
+      ramRdEnMask     => "100",
+      ramRdEnMaskNext => "100",
+      rdFinalAddrNext => (others => '0'));
+
+   type SegRegArray is array (natural range <>) of SegRegType;
+
    type DataRegType is record
       ramWrEn         : sl;
-      ramWrEnMask     : slv(2 downto 0);
-      ramRdEnMask     : slv(2 downto 0);
-      ramRdEnMaskNext : slv(2 downto 0);
       rdSetupDone     : sl;
-      ramWrAddr       : slv(RAM_ADDR_WIDTH_G-1 downto 0);
+      ramWrAddr       : slv(RAM_ADDR_WIDTH_C-1 downto 0);  -- May include seg addr!
       ramWrAddrNext   : slv(RAM_ADDR_WIDTH_G-1 downto 0);
       rdFinalAddr     : slv(RAM_ADDR_WIDTH_G-1 downto 0);
-      rdFinalAddrNext : slv(RAM_ADDR_WIDTH_G-1 downto 0);
       ramWrData       : slv(8*DATA_BYTES_G-1 downto 0);
       dataFrameTxLast : sl;
       dataFrameRxDone : sl;
       dataTrigState   : DataTrigStateType;
+      currSegWr       : slv(SEGS_ADDR_WIDTH_G-1 downto 0);
+      segCaptured     : sl;
+      segRegs         : SegRegArray(N_SEGS_C-1 downto 0);
    end record;
 
    constant DATA_REG_INIT_C : DataRegType := (
       ramWrEn         => '0',
-      ramWrEnMask     => "001",
-      ramRdEnMask     => "100",
-      ramRdEnMaskNext => "100",
       rdSetupDone     => '0',
       ramWrAddr       => (others => '0'),
       ramWrAddrNext   => (others => '0'),
       rdFinalAddr     => (others => '0'),
-      rdFinalAddrNext => (others => '0'),
       ramWrData       => (others => '0'),
       dataFrameTxLast => '0',
       dataFrameRxDone => '0',
-      dataTrigState   => IDLE_S);
+      dataTrigState   => IDLE_S,
+      currSegWr       => (others => '0'),
+      segCaptured     => '0',
+      segRegs         => (others => SEG_REG_INIT_C));
 
    signal dataR   : DataRegType := DATA_REG_INIT_C;
    signal dataRin : DataRegType;
@@ -180,9 +216,10 @@ architecture rtl of AxiStreamFrameBuffer is
 
    type AxilRegType is record
       softTrig       : sl;
+      softTrigSeg    : slv(SEGS_ADDR_WIDTH_G-1 downto 0);
       rdReq          : sl;
       rdFinalAddr    : slv(RAM_ADDR_WIDTH_G-1 downto 0);
-      ramRdAddr      : slv(RAM_ADDR_WIDTH_G-1 downto 0);
+      ramRdAddr      : slv(RAM_ADDR_WIDTH_C-1 downto 0);  -- May include seg addr!
       rdMoveDone     : sl;
       rdEn           : slv(2 downto 0);
       axilReadSlave  : AxiLiteReadSlaveType;
@@ -190,10 +227,12 @@ architecture rtl of AxiStreamFrameBuffer is
       txMaster       : AxiStreamMasterType;
       axisState      : AxisStateType;
       axisStateIdx   : slv(1 downto 0);
+      currSegRd      : slv(SEGS_ADDR_WIDTH_G-1 downto 0);
    end record;
 
    constant AXIL_REG_INIT_C : AxilRegType := (
       softTrig       => '0',
+      softTrigSeg    => (others => '0'),
       rdReq          => '0',
       rdFinalAddr    => (others => '0'),
       ramRdAddr      => (others => '0'),
@@ -203,7 +242,8 @@ architecture rtl of AxiStreamFrameBuffer is
       axilWriteSlave => AXI_LITE_WRITE_SLAVE_INIT_C,
       txMaster       => axiStreamMasterInit(AXIS_CONFIG_C),
       axisState      => IDLE_S,
-      axisStateIdx   => (others => '0'));
+      axisStateIdx   => (others => '0'),
+      currSegRd      => (others => '0'));
 
    signal axilR   : AxilRegType := AXIL_REG_INIT_C;
    signal axilRin : AxilRegType;
@@ -214,6 +254,7 @@ architecture rtl of AxiStreamFrameBuffer is
    signal rdFinalAddrSync : slv(RAM_ADDR_WIDTH_G-1 downto 0);
    signal rdSetupDoneSync : sl;
    signal rdMoveDoneSync  : sl;
+   signal currSegRdSync   : slv(SEGS_ADDR_WIDTH_G-1 downto 0);
 
    signal dataToAxilSyncIn  : slv(RAM_ADDR_WIDTH_G downto 0);
    signal dataToAxilSyncOut : slv(RAM_ADDR_WIDTH_G downto 0);
@@ -234,7 +275,7 @@ begin
       signal ramWrEnMasked : sl;
    begin
 
-      ramWrEnMasked <= dataR.ramWrEn and dataR.ramWrEnMask(i);
+      ramWrEnMasked <= dataR.ramWrEn and dataR.segRegs(conv_integer(dataR.currSegWr)).ramWrEnMask(i);
 
       GEN_XPM : if (SYNTH_MODE_G = "xpm") generate
          U_Ram : entity surf.SimpleDualPortRamXpm
@@ -245,7 +286,7 @@ begin
                MEMORY_TYPE_G  => MEMORY_TYPE_G,
                READ_LATENCY_G => 2,
                DATA_WIDTH_G   => 8*DATA_BYTES_G,
-               ADDR_WIDTH_G   => RAM_ADDR_WIDTH_G)
+               ADDR_WIDTH_G   => RAM_ADDR_WIDTH_C)  -- May include seg addr!
             port map (
                -- Port A
                clka   => dataClk,
@@ -267,7 +308,7 @@ begin
                MEMORY_TYPE_G  => MEMORY_TYPE_G,
                READ_LATENCY_G => 2,
                DATA_WIDTH_G   => 8*DATA_BYTES_G,
-               ADDR_WIDTH_G   => RAM_ADDR_WIDTH_G)
+               ADDR_WIDTH_G   => RAM_ADDR_WIDTH_C)  -- May include seg addr!
             port map (
                -- Port A
                clka   => dataClk,
@@ -289,7 +330,7 @@ begin
                MEMORY_TYPE_G  => MEMORY_TYPE_G,
                DOB_REG_G      => true,
                DATA_WIDTH_G   => 8*DATA_BYTES_G,
-               ADDR_WIDTH_G   => RAM_ADDR_WIDTH_G)
+               ADDR_WIDTH_G   => RAM_ADDR_WIDTH_C)  -- May include seg addr!
             port map (
                -- Port A
                clka  => dataClk,
@@ -332,11 +373,18 @@ begin
    -----------------------------
 
    dataComb : process (dataR, dataRst, axilRstSync, dataValid, dataValue, dataFrameTxLast,
-                       rdReqSync, dataRdTrig, rdMoveDoneSync) is
-      variable v : DataRegType;
+                       rdReqSync, dataRdTrig, rdMoveDoneSync, dataSeg, currSegRdSync) is
+      variable v            : DataRegType;
+      variable currSegWrInt : integer;
+      variable currSegRdInt : integer;
    begin
       -- Latch the current value
       v := dataR;
+
+      -- Assign current segment variable for convenience
+      -- TODO: Must be v, cannot be dataR value, right?
+      currSegWrInt := conv_integer(v.currSegWr);
+      currSegRdInt := conv_integer(currSegRdSync);
 
       -- Reset strobes
       v.ramWrEn         := '0';
@@ -348,29 +396,34 @@ begin
 
 
       -- Check if last frame was the final frame or if the buffer is full.
-      if (dataR.dataFrameTxLast = '1') or (dataR.ramWrAddr = 2**RAM_ADDR_WIDTH_G - 1) then
+      -- Only care about the lower bits as upper ones set the segment.
+      if (dataR.dataFrameTxLast = '1') or (dataR.ramWrAddr(RAM_ADDR_WIDTH_G-1 downto 0) = 2**RAM_ADDR_WIDTH_G - 1) then
 
          -- Masks only used/updated in safe buffers mode
          if SAFE_BUFFS_G then
             -- Set next buffer for writing to the buffer that is not currently set
             -- for neither read nor write.
-            v.ramWrEnMask     := not (dataR.ramWrEnMask or dataR.ramRdEnMask);
+            v.segRegs(currSegWrInt).ramWrEnMask     := not (dataR.segRegs(currSegWrInt).ramWrEnMask or dataR.segRegs(currSegWrInt).ramRdEnMask);
             -- The next buffer for reading is the last buffer written to so
             -- always the newest frame can be obtained.
-            v.ramRdEnMaskNext := dataR.ramWrEnMask;
+            v.segRegs(currSegWrInt).ramRdEnMaskNext := dataR.segRegs(currSegWrInt).ramWrEnMask;
          end if;
 
          -- Keep track of last address written to during last write so the
          -- correct numbers of words can be read on the next read.
-         v.rdFinalAddrNext := dataR.ramWrAddr;
+         -- Only care about the lower bits as upper ones set the segment.
+         v.segRegs(currSegWrInt).rdFinalAddrNext := dataR.ramWrAddr(RAM_ADDR_WIDTH_G-1 downto 0);
 
-         v.ramWrAddr     := (others => '0');
+         v.ramWrAddr     := (others => '0');  -- Also zeros the segment if segments are enabled
          v.ramWrAddrNext := (others => '0');
 
          -- Signal frame receive done and new frame available for readout.
          -- The next write can actually proceed in the same cycle as this signal
          -- is asserted in.
          v.dataFrameRxDone := '1';
+
+         -- Reset segment captured
+         v.segCaptured := '0';
 
       end if;
 
@@ -380,13 +433,29 @@ begin
       -- are updated.
       if (dataValid = '1') then
 
+         -- Capture the segment if not done already for the given frame.
+         -- The segment is fixed for a given frame at its start and can
+         -- only be changed by closing out the frame and then transmitting
+         -- a new one. I.e. we assume the segment is known ahead of time for
+         -- each frame.
+         if dataR.segCaptured = '0' then
+            v.currSegWr   := dataSeg;
+            v.segCaptured := '1';
+         end if;
+
          -- Strobe write enable
          v.ramWrEn := '1';
 
          -- Increment write address. Reference v, not r as this might have
          -- been reset by the frame end condition above.
-         v.ramWrAddr     := v.ramWrAddrNext;  -- Mini-pipeline
-         v.ramWrAddrNext := v.ramWrAddrNext + 1;
+         -- Only care about the lower bits as upper ones set the segment.
+         v.ramWrAddr(RAM_ADDR_WIDTH_G-1 downto 0) := v.ramWrAddrNext;  -- Mini-pipeline
+         v.ramWrAddrNext                          := v.ramWrAddrNext + 1;
+
+         -- Add on the segment address if enabled (otherwise upper bits do not exist)
+         if SEGS_EN_G then
+            v.ramWrAddr(RAM_ADDR_WIDTH_C-1 downto RAM_ADDR_WIDTH_G) := v.currSegWr;
+         end if;
 
       end if;
 
@@ -399,10 +468,10 @@ begin
                   -- Actually apply the next read mask. Do this from v, not r,
                   -- as read can start as early as the next next cycle where
                   -- a different write mask may be used.
-                  v.ramRdEnMask := v.ramRdEnMaskNext;
+                  v.segRegs(currSegRdInt).ramRdEnMask := v.segRegs(currSegRdInt).ramRdEnMaskNext;
                end if;
                -- Drive the read final address signal
-               v.rdFinalAddr := dataR.rdFinalAddrNext;
+               v.rdFinalAddr := dataR.segRegs(currSegRdInt).rdFinalAddrNext;
 
                -- Assert setup done signal
                v.rdSetupDone   := '1';
@@ -448,8 +517,8 @@ begin
    -- Multiplexing the read lines is only required when using multiple
    -- buffers (safe buffers true).
    ramRdData <= ramRdDataArr(0) when not SAFE_BUFFS_G else
-                ramRdDataArr(0) when dataR.ramRdEnMask = "001" else
-                ramRdDataArr(1) when dataR.ramRdEnMask = "010" else
+                ramRdDataArr(0) when dataR.segRegs(conv_integer(currSegRdSync)).ramRdEnMask = "001" else
+                ramRdDataArr(1) when dataR.segRegs(conv_integer(currSegRdSync)).ramRdEnMask = "010" else
                 ramRdDataArr(2);
 
    -------------------------------------------------------------
@@ -479,23 +548,25 @@ begin
          TPD_G          => TPD_G,
          RST_POLARITY_G => RST_POLARITY_G,
          RST_ASYNC_G    => RST_ASYNC_G,
-         WIDTH_G        => 2)
+         WIDTH_G        => SEGS_ADDR_WIDTH_G + 2)
       port map (
          clk     => dataClk,
          dataIn  => axilToDataSyncIn,
          dataOut => axilToDataSyncOut);
 
-   axilToDataSyncIn(0) <= axilR.rdReq;
-   axilToDataSyncIn(1) <= axilR.rdMoveDone;
-   rdReqSync           <= axilToDataSyncOut(0);
-   rdMoveDoneSync      <= axilToDataSyncOut(1);
+   axilToDataSyncIn(0)                              <= axilR.rdReq;
+   axilToDataSyncIn(1)                              <= axilR.rdMoveDone;
+   axilToDataSyncIn(2+SEGS_ADDR_WIDTH_G-1 downto 2) <= axilR.currSegRd;
+   rdReqSync                                        <= axilToDataSyncOut(0);
+   rdMoveDoneSync                                   <= axilToDataSyncOut(1);
+   currSegRdSync                                    <= axilToDataSyncIn(2+SEGS_ADDR_WIDTH_G-1 downto 2);
 
    -------------------------------
    -- Main AXI-Lite/Stream process
    -------------------------------
 
-   axiComb : process (axilR, axilReadMaster, axilRst, dataRstSync, axilWriteMaster,
-                      ramRdData, rdFinalAddrSync, rdSetupDoneSync, txSlave, axilRdTrig) is
+   axiComb : process (axilR, axilReadMaster, axilRst, dataRstSync, axilWriteMaster, ramRdData,
+                      rdFinalAddrSync, rdSetupDoneSync, txSlave, axilRdTrig, axilSeg) is
       variable v      : AxilRegType;
       variable axilEp : AxiLiteEndpointType;
    begin
@@ -518,6 +589,8 @@ begin
       axiSlaveRegisterR(axilEp, x"4", 0, toSlv(RAM_ADDR_WIDTH_G, 8));
       axiSlaveRegisterR(axilEp, x"4", 8, axilR.axisStateIdx);
       axiSlaveRegister (axilEp, x"8", 0, v.softTrig);
+      axiSlaveRegister (axilEp, x"C", 0, v.softTrigSeg);
+      axiSlaveRegisterR(axilEp, x"10", 0, axilR.currSegRd);
 
       -- Close the transaction
       axiSlaveDefault(axilEp, v.axilWriteSlave, v.axilReadSlave, AXI_RESP_DECERR_C);
@@ -547,13 +620,19 @@ begin
                -- Issue a read request, keep asserted until data process
                -- signals ready to make sure the data process caches it.
                v.rdReq := '1';
+               -- Latch the requested segment from the corresponding source.
+               if v.softTrig = '1' then
+                  v.currSegRd := v.softTrigSeg;
+               elsif axilRdTrig = '1' then
+                  v.currSegRd := axilSeg;
+               end if;
             end if;
 
             if (rdSetupDoneSync = '1') then
                -- Latch read final address
                v.rdFinalAddr := rdFinalAddrSync;
                -- Reset read address
-               v.ramRdAddr   := (others => '0');
+               v.ramRdAddr   := (others => '0');  -- Also zeros the segment if segments are enabled
                -- Reset read request signal in case it was set
                v.rdReq       := '0';
 
@@ -595,7 +674,8 @@ begin
                v.txMaster.tData(8*DATA_BYTES_G-1 downto 0) := ramRdData;
 
                -- Check for Start Of Frame (SOF)
-               if (axilR.ramRdAddr = 0) then
+               -- Only care about the lower bits as upper ones set the segment.
+               if (axilR.ramRdAddr(RAM_ADDR_WIDTH_G-1 downto 0) = 0) then
 
                   -- Set the SOF bit
                   ssiSetUserSof(AXIS_CONFIG_C, v.txMaster, '1');
@@ -603,7 +683,8 @@ begin
                end if;
 
                -- Check for End of Frame (EOF), i.e. the last address.
-               if (axilR.ramRdAddr = axilR.rdFinalAddr) then
+               -- Only care about the lower bits as upper ones set the segment.
+               if (axilR.ramRdAddr(RAM_ADDR_WIDTH_G-1 downto 0) = axilR.rdFinalAddr) then
 
                   -- Set the EOF bit
                   v.txMaster.tLast := '1';
@@ -612,8 +693,15 @@ begin
                   v.axisState := DONE_S;
 
                else
-                  -- Increment the read address
-                  v.ramRdAddr := axilR.ramRdAddr + 1;
+                  -- Increment the read address.
+                  -- Only care about the lower bits as upper ones set the segment.
+                  v.ramRdAddr(RAM_ADDR_WIDTH_G-1 downto 0) := axilR.ramRdAddr(RAM_ADDR_WIDTH_G-1 downto 0) + 1;
+               end if;
+
+               -- Add on the segment address if enabled (otherwise upper bits do not exist)
+               -- TODO: I think this should be fine outside the tvalid/rden if clause.
+               if SEGS_EN_G then
+                  v.ramRdAddr(RAM_ADDR_WIDTH_C-1 downto RAM_ADDR_WIDTH_G) := v.currSegRd;
                end if;
 
             end if;
@@ -627,6 +715,7 @@ begin
       end if;
 
       -- Check for change in address
+      -- TODO: Should be sufficient to check lower bits (ignore segment address) as only changed together
       if (axilR.ramRdAddr /= v.ramRdAddr) then
          -- Queue up the next read by writing to shift register
          v.rdEn(0) := '1';
