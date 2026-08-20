@@ -100,7 +100,6 @@ entity AxiStreamFrameBuffer is
       -- AXI-Lite interface (axilClk domain)
       axilClk         : in  sl;
       axilRst         : in  sl;
-      axilSeg         : in  slv(SEGS_ADDR_WIDTH_G-1 downto 0) := (others => '0');
       axilReadMaster  : in  AxiLiteReadMasterType;
       axilReadSlave   : out AxiLiteReadSlaveType;
       axilWriteMaster : in  AxiLiteWriteMasterType;
@@ -110,7 +109,8 @@ entity AxiStreamFrameBuffer is
       axisClk         : in  sl;
       axisRst         : in  sl;
       axisMaster      : out AxiStreamMasterType;
-      axisSlave       : in  AxiStreamSlaveType);
+      axisSlave       : in  AxiStreamSlaveType;
+      axisSeg         : in  slv(SEGS_ADDR_WIDTH_G-1 downto 0) := (others => '0'));
 end entity AxiStreamFrameBuffer;
 
 architecture rtl of AxiStreamFrameBuffer is
@@ -437,9 +437,11 @@ begin
          -- only be changed by closing out the frame and then transmitting
          -- a new one. I.e. we assume the segment is known ahead of time for
          -- each frame.
-         if dataR.segCaptured = '0' then
-            v.currSegWr   := dataSeg;
-            v.segCaptured := '1';
+         if SEGS_EN_G then              -- Only required when segments enabled
+            if dataR.segCaptured = '0' then
+               v.currSegWr   := dataSeg;
+               v.segCaptured := '1';
+            end if;
          end if;
 
          -- Strobe write enable
@@ -565,7 +567,7 @@ begin
    -------------------------------
 
    axiComb : process (axilR, axilReadMaster, axilRst, dataRstSync, axilWriteMaster, ramRdData,
-                      rdFinalAddrSync, rdSetupDoneSync, txSlave, axilRdTrig, axilSeg) is
+                      rdFinalAddrSync, rdSetupDoneSync, txSlave, axilRdTrig, axisSeg) is
       variable v      : AxilRegType;
       variable axilEp : AxiLiteEndpointType;
    begin
@@ -620,10 +622,12 @@ begin
                -- signals ready to make sure the data process caches it.
                v.rdReq := '1';
                -- Latch the requested segment from the corresponding source.
-               if v.softTrig = '1' then
-                  v.currSegRd := v.softTrigSeg;
-               elsif axilRdTrig = '1' then
-                  v.currSegRd := axilSeg;
+               if SEGS_EN_G then        -- Only required when segments enabled
+                  if v.softTrig = '1' then
+                     v.currSegRd := v.softTrigSeg;
+                  elsif axilRdTrig = '1' then
+                     v.currSegRd := axisSeg;
+                  end if;
                end if;
             end if;
 
