@@ -32,6 +32,8 @@ architecture testbed of AxiStreamFrameBufferTb is
 
    constant AXIS_CONFIG_C : AxiStreamConfigType := ssiAxiStreamConfig(dataBytes => 2);
 
+   constant SEGS_ADDR_WIDTH_C : positive := 2;
+
    type RegType is record
       data       : slv(15 downto 0);
       dataValid  : sl;
@@ -39,6 +41,9 @@ architecture testbed of AxiStreamFrameBufferTb is
       cnt        : slv(11 downto 0);
       dataRdTrig : sl;
       axilRdTrig : sl;
+      dataSegWr  : slv(SEGS_ADDR_WIDTH_C-1 downto 0);
+      dataSegRd  : slv(SEGS_ADDR_WIDTH_C-1 downto 0);
+      axisSegRd  : slv(SEGS_ADDR_WIDTH_C-1 downto 0);
    end record;
 
    constant REG_INIT_C : RegType := (
@@ -47,7 +52,10 @@ architecture testbed of AxiStreamFrameBufferTb is
       frameDone  => '0',
       cnt        => (others => '0'),
       dataRdTrig => '0',
-      axilRdTrig => '0');
+      axilRdTrig => '0',
+      dataSegWr  => (others => '0'),
+      dataSegRd  => (others => '0'),
+      axisSegRd  => (others => '0'));
 
    signal r   : RegType := REG_INIT_C;
    signal rin : RegType;
@@ -101,8 +109,11 @@ begin
          COMMON_CLK_G        => false,  -- true if dataClk=axilClk
          DATA_BYTES_G        => 2,      -- 16-bit data
          RAM_ADDR_WIDTH_G    => 10,     -- 1024 samples deep
-         SEGS_EN_G           => false,  -- Segments disabled
-         -- SEGS_ADDR_WIDTH_G   => 2,
+         -- Segments can be simply disabled for simulation without
+         -- segments. The segment selection signals set in logic
+         -- below will be ignored by the module.
+         SEGS_EN_G           => true,
+         SEGS_ADDR_WIDTH_G   => SEGS_ADDR_WIDTH_C,
          SAFE_BUFFS_G        => true,
          -- AXI Stream Configurations
          GEN_SYNC_FIFO_G     => true,   -- true if axisClk=axilClk
@@ -111,10 +122,12 @@ begin
          -- Data to store in frame buffer (dataClk domain)
          dataClk         => dataClk,
          dataRst         => dataRst,
-         dataValue       => r.data,
          dataValid       => r.dataValid,
+         dataValue       => r.data,
+         dataSegWr       => r.dataSegWr,
          dataFrameTxLast => r.frameDone,
          dataRdTrig      => r.dataRdTrig,
+         dataSegRd       => r.dataSegRd,
          -- AXI-Lite interface (axilClk domain)
          axilClk         => axiClk,
          axilRst         => axiRst,
@@ -127,7 +140,8 @@ begin
          axisClk         => axiClk,
          axisRst         => axiRst,
          axisMaster      => axisMaster,
-         axisSlave       => axisSlave);
+         axisSlave       => axisSlave,
+         axisSegRd       => r.axisSegRd);
 
    comb : process (r, dataRst) is
       variable v : RegType;
@@ -162,6 +176,8 @@ begin
          if (r.cnt = 1023) then
             -- Set the flag
             v.frameDone := '1';
+            -- Switch to another segment for the second frame
+            v.dataSegWr := toslv(1, SEGS_ADDR_WIDTH_C);
          end if;
 
          -- Check for the readout trigger event
@@ -185,6 +201,9 @@ begin
       if (r.cnt > 2048 + 512) then
          -- Set the flag
          v.dataRdTrig := '1';
+         -- This time around, read the second segment
+         v.dataSegRd  := toslv(1, SEGS_ADDR_WIDTH_C);
+         v.axisSegRd  := toslv(1, SEGS_ADDR_WIDTH_C);
       end if;
 
       -- Synchronous Reset
