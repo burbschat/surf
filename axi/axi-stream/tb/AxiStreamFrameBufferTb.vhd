@@ -100,8 +100,9 @@ begin
          TPD_G               => TPD_C,
          COMMON_CLK_G        => false,  -- true if dataClk=axilClk
          DATA_BYTES_G        => 2,      -- 16-bit data
-         -- RAM_ADDR_WIDTH_G    => 11,    -- 2048 samples deep
          RAM_ADDR_WIDTH_G    => 10,     -- 1024 samples deep
+         SEGS_EN_G           => false,  -- Segments disabled
+         -- SEGS_ADDR_WIDTH_G   => 2,
          SAFE_BUFFS_G        => true,
          -- AXI Stream Configurations
          GEN_SYNC_FIFO_G     => true,   -- true if axisClk=axilClk

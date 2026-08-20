@@ -78,7 +78,7 @@ entity AxiStreamFrameBuffer is
       COMMON_CLK_G        : boolean                := false;  -- true if dataClk=axilClk
       DATA_BYTES_G        : positive               := 16;
       RAM_ADDR_WIDTH_G    : positive range 1 to 32 := 9;
-      SEGS_EN_G           : boolean                := true;  -- TODO: default to false
+      SEGS_EN_G           : boolean                := false;
       SEGS_ADDR_WIDTH_G   : positive range 1 to 8  := 1;
       -- AXI Stream Configurations
       INT_PIPE_STAGES_G   : natural                := 1;
@@ -90,18 +90,17 @@ entity AxiStreamFrameBuffer is
    port (
       -- Data to store in frame buffer (dataClk domain)
       dataClk         : in  sl;
-      dataRst         : in  sl := '0';
-      dataValid       : in  sl := '1';
+      dataRst         : in  sl                                := '0';
+      dataValid       : in  sl                                := '1';
       dataValue       : in  slv(8*DATA_BYTES_G-1 downto 0);
-      -- TODO: Decide how to handle invalid segment number
-      dataSeg         : in  slv(SEGS_ADDR_WIDTH_G-1 downto 0);
-      dataFrameTxLast : in  sl := '0';  -- Signal end of frame
-      dataFrameRxDone : out sl := '0';  -- Asserted on end of frame (due to dataFrameTxLast or buffer full)
+      dataSeg         : in  slv(SEGS_ADDR_WIDTH_G-1 downto 0) := (others => '0');
+      dataFrameTxLast : in  sl                                := '0';  -- Signal end of frame
+      dataFrameRxDone : out sl                                := '0';  -- Asserted on end of frame (due to dataFrameTxLast or buffer full)
       dataRdTrig      : in  sl;  -- Readout trigger synchronous to dataClk
       -- AXI-Lite interface (axilClk domain)
       axilClk         : in  sl;
       axilRst         : in  sl;
-      axilSeg         : in  slv(SEGS_ADDR_WIDTH_G-1 downto 0);
+      axilSeg         : in  slv(SEGS_ADDR_WIDTH_G-1 downto 0) := (others => '0');
       axilReadMaster  : in  AxiLiteReadMasterType;
       axilReadSlave   : out AxiLiteReadSlaveType;
       axilWriteMaster : in  AxiLiteWriteMasterType;
