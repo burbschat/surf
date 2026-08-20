@@ -130,7 +130,7 @@ architecture rtl of AxiStreamFrameBuffer is
 
    function get_n_segs return integer is
    begin
-      if SEGS_EN_G then return 2**SEGS_ADDR_WIDTH_G; else return 0; end if;
+      if SEGS_EN_G then return 2**SEGS_ADDR_WIDTH_G; else return 1; end if;
    end function get_n_segs;
 
    function get_ram_addr_width return integer is
@@ -257,8 +257,8 @@ architecture rtl of AxiStreamFrameBuffer is
 
    signal dataToAxilSyncIn  : slv(RAM_ADDR_WIDTH_G downto 0);
    signal dataToAxilSyncOut : slv(RAM_ADDR_WIDTH_G downto 0);
-   signal axilToDataSyncIn  : slv(1 downto 0);
-   signal axilToDataSyncOut : slv(1 downto 0);
+   signal axilToDataSyncIn  : slv(2+SEGS_ADDR_WIDTH_G-1 downto 0);
+   signal axilToDataSyncOut : slv(2+SEGS_ADDR_WIDTH_G-1 downto 0);
 
    signal rdReqSync : sl;
 
