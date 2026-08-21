@@ -23,22 +23,27 @@ use surf.SsiPkg.all;
 
 entity AxiStreamFrameBufferIpIntegrator is
    generic (
-      TPD_G          : time    := 1 ns;
-      ASYNC_CLOCKS_G : boolean := true;
-      SAFE_BUFFS_G   : boolean := true);
+      TPD_G             : time                  := 1 ns;
+      ASYNC_CLOCKS_G    : boolean               := true;
+      SAFE_BUFFS_G      : boolean               := true;
+      SEGS_EN_G         : boolean               := false;
+      SEGS_ADDR_WIDTH_G : positive range 1 to 8 := 1);
    port (
       dataClk         : in  sl;
-      dataRst         : in  sl := '0';
-      dataValid       : in  sl := '1';
+      dataRst         : in  sl                                := '0';
+      dataValid       : in  sl                                := '1';
       dataValue       : in  slv(15 downto 0);
-      dataFrameTxLast : in  sl := '0';
-      dataFrameRxDone : out sl := '0';
+      dataSegWr       : in  slv(SEGS_ADDR_WIDTH_G-1 downto 0) := (others => '0');
+      dataFrameTxLast : in  sl                                := '0';
+      dataFrameRxDone : out sl                                := '0';
       dataRdTrig      : in  sl;
+      dataSegRd       : in  slv(SEGS_ADDR_WIDTH_G-1 downto 0) := (others => '0');
       axilClk         : in  sl;
       axilRst         : in  sl;
       axilRdTrig      : in  sl;
       axisClk         : in  sl;
       axisRst         : in  sl;
+      axisSegRd       : in  slv(SEGS_ADDR_WIDTH_G-1 downto 0) := (others => '0');
       S_AXI_AWADDR    : in  slv(7 downto 0);
       S_AXI_AWPROT    : in  slv(2 downto 0);
       S_AXI_AWVALID   : in  sl;
@@ -167,15 +172,19 @@ begin
          RAM_ADDR_WIDTH_G    => 4,
          SAFE_BUFFS_G        => SAFE_BUFFS_G,
          GEN_SYNC_FIFO_G     => not ASYNC_CLOCKS_G,
-         AXI_STREAM_CONFIG_G => AXIS_CONFIG_C)
+         AXI_STREAM_CONFIG_G => AXIS_CONFIG_C,
+         SEGS_EN_G           => SEGS_EN_G,
+         SEGS_ADDR_WIDTH_G   => SEGS_ADDR_WIDTH_G)
       port map (
          dataClk         => dataClk,
          dataRst         => dataRst,
          dataValid       => dataValid,
          dataValue       => dataValue,
+         dataSegWr       => dataSegWr,
          dataFrameTxLast => dataFrameTxLast,
          dataFrameRxDone => dataFrameRxDone,
          dataRdTrig      => dataRdTrig,
+         dataSegRd       => dataSegRd,
          axilClk         => axilClk,
          axilRst         => axilRst,
          axilReadMaster  => axilReadMaster,
@@ -186,6 +195,7 @@ begin
          axisClk         => axisClk,
          axisRst         => axisRst,
          axisMaster      => axisMaster,
-         axisSlave       => axisSlave);
+         axisSlave       => axisSlave,
+         axisSegRd       => axisSegRd);
 
 end architecture rtl;

@@ -185,6 +185,7 @@ architecture rtl of AxiStreamFrameBuffer is
       dataFrameRxDone : sl;
       dataTrigState   : DataTrigStateType;
       segWr           : slv(SEGS_ADDR_WIDTH_G-1 downto 0);
+      segRd           : slv(SEGS_ADDR_WIDTH_G-1 downto 0);
       segCaptured     : sl;
       segRegs         : SegRegArray(N_SEGS_C-1 downto 0);
    end record;
@@ -200,6 +201,7 @@ architecture rtl of AxiStreamFrameBuffer is
       dataFrameRxDone => '0',
       dataTrigState   => IDLE_S,
       segWr           => (others => '0'),
+      segRd           => (others => '0'),
       segCaptured     => '0',
       segRegs         => (others => SEG_REG_INIT_C));
 
@@ -252,12 +254,13 @@ architecture rtl of AxiStreamFrameBuffer is
    signal dataRstSync : sl;
 
    signal rdFinalAddrSync : slv(RAM_ADDR_WIDTH_G-1 downto 0);
+   signal dataSegRdSync   : slv(SEGS_ADDR_WIDTH_G-1 downto 0);
    signal rdSetupDoneSync : sl;
    signal rdMoveDoneSync  : sl;
    signal segRdSync       : slv(SEGS_ADDR_WIDTH_G-1 downto 0);
 
-   signal dataToAxilSyncIn  : slv(RAM_ADDR_WIDTH_G downto 0);
-   signal dataToAxilSyncOut : slv(RAM_ADDR_WIDTH_G downto 0);
+   signal dataToAxilSyncIn  : slv(RAM_ADDR_WIDTH_G + SEGS_ADDR_WIDTH_G downto 0);
+   signal dataToAxilSyncOut : slv(RAM_ADDR_WIDTH_G + SEGS_ADDR_WIDTH_G downto 0);
    signal axilToDataSyncIn  : slv(2+SEGS_ADDR_WIDTH_G-1 downto 0);
    signal axilToDataSyncOut : slv(2+SEGS_ADDR_WIDTH_G-1 downto 0);
 
@@ -373,17 +376,14 @@ begin
    -----------------------------
 
    dataComb : process (dataR, dataRst, axilRstSync, dataValid, dataValue, dataFrameTxLast,
-                       rdReqSync, dataRdTrig, rdMoveDoneSync, dataSegWr, segRdSync) is
-      variable v        : DataRegType;
-      variable segWrInt : integer;
-      variable segRdInt : integer;
+                       rdReqSync, dataRdTrig, rdMoveDoneSync, dataSegWr, segRdSync, dataSegRd) is
+      variable v            : DataRegType;
+      variable segWrCurrInt : integer;
+      variable segWrPrevInt : integer;
+      variable frameEnd     : boolean;
    begin
       -- Latch the current value
       v := dataR;
-
-      -- Assign current segment variable for convenience
-      -- TODO: Must be v, cannot be dataR value, right?
-      segWrInt := conv_integer(v.segWr);
 
       -- Reset strobes
       v.ramWrEn         := '0';
@@ -393,25 +393,53 @@ begin
       v.ramWrData       := dataValue;
       v.dataFrameTxLast := dataFrameTxLast;
 
+      -- Set frame end condition variable
+      frameEnd := (dataR.dataFrameTxLast = '1') or (dataR.ramWrAddr(RAM_ADDR_WIDTH_G-1 downto 0) = 2**RAM_ADDR_WIDTH_G - 1);
+
+      -- Do the segCaptured reset first so the capture works also in the
+      -- cycle immediately after the previous frame ends.
+      -- Otherwise the segWr is latched one cycle to late and the first
+      -- read goes to the wrong memory segment as the address segment
+      -- bits are not yet set.
+      if frameEnd then
+         -- Reset segment captured
+         v.segCaptured := '0';
+      end if;
+
+      -- Capture the segment if not done already for the given frame.
+      -- The segment is fixed for a given frame at its start and can
+      -- only be changed by closing out the frame and then transmitting
+      -- a new one. I.e. we assume the segment is known ahead of time for
+      -- each frame.
+      if (dataValid = '1') and SEGS_EN_G then  -- Only required when segments enabled
+         if (v.segCaptured = '0') then
+            v.segWr       := dataSegWr;
+            v.segCaptured := '1';
+         end if;
+      end if;
+
+      -- Assign current/previous segment variable converted to integer for convenience
+      segWrCurrInt := conv_integer(v.segWr);
+      segWrPrevInt := conv_integer(dataR.segWr);
 
       -- Check if last frame was the final frame or if the buffer is full.
       -- Only care about the lower bits as upper ones set the segment.
-      if (dataR.dataFrameTxLast = '1') or (dataR.ramWrAddr(RAM_ADDR_WIDTH_G-1 downto 0) = 2**RAM_ADDR_WIDTH_G - 1) then
+      if frameEnd then
 
          -- Masks only used/updated in safe buffers mode
          if SAFE_BUFFS_G then
             -- Set next buffer for writing to the buffer that is not currently set
             -- for neither read nor write.
-            v.segRegs(segWrInt).ramWrEnMask     := not (dataR.segRegs(segWrInt).ramWrEnMask or dataR.segRegs(segWrInt).ramRdEnMask);
+            v.segRegs(segWrPrevInt).ramWrEnMask     := not (dataR.segRegs(segWrCurrInt).ramWrEnMask or dataR.segRegs(segWrCurrInt).ramRdEnMask);
             -- The next buffer for reading is the last buffer written to so
             -- always the newest frame can be obtained.
-            v.segRegs(segWrInt).ramRdEnMaskNext := dataR.segRegs(segWrInt).ramWrEnMask;
+            v.segRegs(segWrPrevInt).ramRdEnMaskNext := dataR.segRegs(segWrCurrInt).ramWrEnMask;
          end if;
 
          -- Keep track of last address written to during last write so the
          -- correct numbers of words can be read on the next read.
          -- Only care about the lower bits as upper ones set the segment.
-         v.segRegs(segWrInt).rdFinalAddrNext := dataR.ramWrAddr(RAM_ADDR_WIDTH_G-1 downto 0);
+         v.segRegs(segWrPrevInt).rdFinalAddrNext := dataR.ramWrAddr(RAM_ADDR_WIDTH_G-1 downto 0);
 
          v.ramWrAddr     := (others => '0');  -- Also zeros the segment if segments are enabled
          v.ramWrAddrNext := (others => '0');
@@ -421,9 +449,6 @@ begin
          -- is asserted in.
          v.dataFrameRxDone := '1';
 
-         -- Reset segment captured
-         v.segCaptured := '0';
-
       end if;
 
       -- Only write if data valid. There may be still data received for the
@@ -431,19 +456,6 @@ begin
       -- start with the next frame immediately in the frame where write masks
       -- are updated.
       if (dataValid = '1') then
-
-         -- Capture the segment if not done already for the given frame.
-         -- The segment is fixed for a given frame at its start and can
-         -- only be changed by closing out the frame and then transmitting
-         -- a new one. I.e. we assume the segment is known ahead of time for
-         -- each frame.
-         if SEGS_EN_G then              -- Only required when segments enabled
-            if dataR.segCaptured = '0' then
-               v.segWr       := dataSegWr;
-               v.segCaptured := '1';
-            end if;
-         end if;
-
          -- Strobe write enable
          v.ramWrEn := '1';
 
@@ -452,12 +464,11 @@ begin
          -- Only care about the lower bits as upper ones set the segment.
          v.ramWrAddr(RAM_ADDR_WIDTH_G-1 downto 0) := v.ramWrAddrNext;  -- Mini-pipeline
          v.ramWrAddrNext                          := v.ramWrAddrNext + 1;
+      end if;
 
-         -- Add on the segment address if enabled (otherwise upper bits do not exist)
-         if SEGS_EN_G then
-            v.ramWrAddr(RAM_ADDR_WIDTH_C-1 downto RAM_ADDR_WIDTH_G) := v.segWr;
-         end if;
-
+      -- Add on the segment address if enabled (otherwise upper bits do not exist)
+      if SEGS_EN_G then
+         v.ramWrAddr(RAM_ADDR_WIDTH_C-1 downto RAM_ADDR_WIDTH_G) := v.segWr;
       end if;
 
       case dataR.dataTrigState is
@@ -469,12 +480,12 @@ begin
                -- dataSegRd will take precedence.
                if SEGS_EN_G then  -- Second case technically already guarded in axil process
                   if dataRdTrig = '1' then
-                     segRdInt := conv_integer(dataSegRd);
+                     v.segRd := dataSegRd;
                   elsif rdReqSync = '1' then
-                     segRdInt := conv_integer(segRdSync);
+                     v.segRd := segRdSync;
                   end if;
                else
-                  segRdInt := 0;        -- Always 0 if segments disabled
+                  v.segRd := (others => '0');  -- Always 0 if segments disabled
                end if;
 
                -- Masks only used/updated in safe buffers mode
@@ -482,11 +493,11 @@ begin
                   -- Actually apply the next read mask. Do this from v, not r,
                   -- as read can start as early as the next next cycle where
                   -- a different write mask may be used.
-                  v.segRegs(segRdInt).ramRdEnMask := v.segRegs(segRdInt).ramRdEnMaskNext;
+                  v.segRegs(conv_integer(v.segRd)).ramRdEnMask := v.segRegs(conv_integer(v.segRd)).ramRdEnMaskNext;
                end if;
                -- Drive the read final address signal
                -- if (rdReqSync = '1') or (dataRdTrig = '1') then
-               v.rdFinalAddr := dataR.segRegs(segRdInt).rdFinalAddrNext;
+               v.rdFinalAddr := dataR.segRegs(conv_integer(v.segRd)).rdFinalAddrNext;
 
                -- Assert setup done signal
                v.rdSetupDone   := '1';
@@ -532,8 +543,8 @@ begin
    -- Multiplexing the read lines is only required when using multiple
    -- buffers (safe buffers true).
    ramRdData <= ramRdDataArr(0) when not SAFE_BUFFS_G else
-                ramRdDataArr(0) when dataR.segRegs(conv_integer(segRdSync)).ramRdEnMask = "001" else
-                ramRdDataArr(1) when dataR.segRegs(conv_integer(segRdSync)).ramRdEnMask = "010" else
+                ramRdDataArr(0) when dataR.segRegs(conv_integer(axilR.segRd)).ramRdEnMask = "001" else
+                ramRdDataArr(1) when dataR.segRegs(conv_integer(axilR.segRd)).ramRdEnMask = "010" else
                 ramRdDataArr(2);
 
    -------------------------------------------------------------
@@ -546,16 +557,19 @@ begin
          TPD_G          => TPD_G,
          RST_POLARITY_G => RST_POLARITY_G,
          RST_ASYNC_G    => RST_ASYNC_G,
-         WIDTH_G        => RAM_ADDR_WIDTH_G + 1)
+         WIDTH_G        => RAM_ADDR_WIDTH_G + SEGS_ADDR_WIDTH_G + 1)
       port map (
          clk     => axilClk,
          dataIn  => dataToAxilSyncIn,
          dataOut => dataToAxilSyncOut);
 
-   dataToAxilSyncIn(RAM_ADDR_WIDTH_G-1 downto 0) <= dataR.rdFinalAddr;
-   dataToAxilSyncIn(RAM_ADDR_WIDTH_G)            <= dataR.rdSetupDone;
-   rdFinalAddrSync                               <= dataToAxilSyncOut(RAM_ADDR_WIDTH_G-1 downto 0);
-   rdSetupDoneSync                               <= dataToAxilSyncOut(RAM_ADDR_WIDTH_G);
+   dataToAxilSyncIn(RAM_ADDR_WIDTH_G - 1 downto 0)                                    <= dataR.rdFinalAddr;
+   dataToAxilSyncIn(RAM_ADDR_WIDTH_G + SEGS_ADDR_WIDTH_G - 1 downto RAM_ADDR_WIDTH_G) <= dataR.segRd;
+   dataToAxilSyncIn(RAM_ADDR_WIDTH_G + SEGS_ADDR_WIDTH_G)                             <= dataR.rdSetupDone;
+   -- Add the dataRdSeg here
+   rdFinalAddrSync                                                                    <= dataToAxilSyncOut(RAM_ADDR_WIDTH_G-1 downto 0);
+   dataSegRdSync                                                                      <= dataToAxilSyncOut(RAM_ADDR_WIDTH_G + SEGS_ADDR_WIDTH_G - 1 downto RAM_ADDR_WIDTH_G);
+   rdSetupDoneSync                                                                    <= dataToAxilSyncOut(RAM_ADDR_WIDTH_G + SEGS_ADDR_WIDTH_G);
 
    -- Synchronize from axil to data process
    U_SyncVec_axilToData : entity surf.SynchronizerVector
@@ -574,14 +588,14 @@ begin
    axilToDataSyncIn(2+SEGS_ADDR_WIDTH_G-1 downto 2) <= axilR.segRd;
    rdReqSync                                        <= axilToDataSyncOut(0);
    rdMoveDoneSync                                   <= axilToDataSyncOut(1);
-   segRdSync                                        <= axilToDataSyncIn(2+SEGS_ADDR_WIDTH_G-1 downto 2);
+   segRdSync                                        <= axilToDataSyncOut(2+SEGS_ADDR_WIDTH_G-1 downto 2);
 
    -------------------------------
    -- Main AXI-Lite/Stream process
    -------------------------------
 
    axiComb : process (axilR, axilReadMaster, axilRst, dataRstSync, axilWriteMaster, ramRdData,
-                      rdFinalAddrSync, rdSetupDoneSync, txSlave, axilRdTrig, axisSegRd) is
+                      rdFinalAddrSync, rdSetupDoneSync, txSlave, axilRdTrig, axisSegRd, dataSegRdSync) is
       variable v      : AxilRegType;
       variable axilEp : AxiLiteEndpointType;
    begin
@@ -645,6 +659,14 @@ begin
                end if;
             end if;
 
+            -- Cover the case for read segment commanded from data side.
+            -- Only capture it when there was no read request issued, i.e.
+            -- the trigger actually happened on the data side.
+            -- TODO: If fails try r instead of v?
+            if SEGS_EN_G and (rdSetupDoneSync = '1') and (v.rdReq = '0') then
+               v.segRd := dataSegRdSync;
+            end if;
+
             if (rdSetupDoneSync = '1') then
                -- Latch read final address
                v.rdFinalAddr := rdFinalAddrSync;
@@ -705,6 +727,11 @@ begin
 
                   -- Set the EOF bit
                   v.txMaster.tLast := '1';
+                  -- TODO: Transmission closed out here can happen before both processess have
+                  -- returned to IDLE_S depending on the clock speeds as it takes some cycles
+                  -- for the data process to receive the synchronized signals and return to
+                  -- IDLE and it won't accept a new trigger unless in idle, resulting in a
+                  -- dead time of a few cycles.
 
                   -- Transmission completed, move signal move done to data proc
                   v.axisState := DONE_S;
@@ -715,15 +742,18 @@ begin
                   v.ramRdAddr(RAM_ADDR_WIDTH_G-1 downto 0) := axilR.ramRdAddr(RAM_ADDR_WIDTH_G-1 downto 0) + 1;
                end if;
 
-               -- Add on the segment address if enabled (otherwise upper bits do not exist)
-               -- TODO: I think this should be fine outside the tvalid/rden if clause.
-               if SEGS_EN_G then
-                  v.ramRdAddr(RAM_ADDR_WIDTH_C-1 downto RAM_ADDR_WIDTH_G) := v.segRd;
-               end if;
-
             end if;
       ----------------------------------------------------------------------
       end case;
+
+      -- Add on the segment address if enabled (otherwise upper bits do not exist)
+      -- Do this outside of the FSM as this should happen for both the MOVE_S and
+      -- IDLE_S as the IDLE_S initializes the address to all zeros which however
+      -- is already the first valid address which requires the segment bits as
+      -- well. For DONE_S we don't really care if those bits are set.
+      if SEGS_EN_G then
+         v.ramRdAddr(RAM_ADDR_WIDTH_C-1 downto RAM_ADDR_WIDTH_G) := v.segRd;
+      end if;
 
       -- Check for external data reset
       if (dataRstSync = '1') then

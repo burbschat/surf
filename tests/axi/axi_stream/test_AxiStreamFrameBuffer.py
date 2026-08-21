@@ -12,6 +12,8 @@
 # - Sweep: Test synchronous and asynchronous clocks as well as with and
 #   without safe buffers. For the latter case the expected behavior is
 #   that the next write overwrites existing data in the buffer.
+#   All combinations of boolean valued generics are covered for a selection
+#   of number of segments.
 # - Stimulus: Drive framed sample sequences into the data interface using
 #   `dataValid` and `dataFrameTxLast`, including both an explicitly
 #   terminated short frame and a frame that overruns the configured buffer
@@ -27,6 +29,7 @@
 #   dataFrameRxDone timing is checked.
 
 import math
+from itertools import product
 
 import cocotb
 import pytest
@@ -130,8 +133,11 @@ class TB:
         assert txn.resp == AxiResp.OKAY
         return int.from_bytes(txn.data, "little")
 
-    async def push_value(self, value: int, last: bool = False):
+    # Helpers for pushing a frame to the buffer
+    async def push_value(self, value: int, last: bool = False, seg: int | None = None):
         self.dut.dataValue.value = value
+        if seg is not None:
+            self.dut.dataSegWr.value = seg
         self.dut.dataValid.value = 1
         self.dut.dataFrameTxLast.value = int(last)
 
@@ -146,6 +152,34 @@ class TB:
         await self.cycle(self.dut.dataClk, 1)
         self.dut.dataFrameTxLast.value = 0
         await self.cycle(self.dut.dataClk, 1)
+
+    # Helpers for triggering a buffer dump
+    async def data_trigger(self, seg: int | None = None):
+        if seg is not None:
+            self.dut.dataSegRd.value = seg
+        self.dut.dataRdTrig.value = 1
+        await self.cycle(self.dut.dataClk, 1)
+        self.dut.dataRdTrig.value = 0
+
+    async def axil_trigger(self, seg: int | None = None):
+        if seg is not None:
+            self.dut.axisSegRd.value = seg
+        self.dut.axilRdTrig.value = 1
+        await self.cycle(self.dut.axilClk, 1)
+        self.dut.axilRdTrig.value = 0
+
+    async def software_trigger(self, seg: int | None = None):
+        if seg is not None:
+            txn = await self.axil.write(0xC, seg.to_bytes(4, "little"))
+            assert txn.resp == AxiResp.OKAY
+
+        txn = await self.axil.write(0x8, (1).to_bytes(4, "little"))
+        assert txn.resp == AxiResp.OKAY
+
+    # Helper to receive frame over AXI-Stream
+    async def recv_frame(self):
+        frame = await with_timeout(self.sink.recv(), 3, "us")
+        return bytes(frame.tdata)
 
 
 # Generate a frame shorter than the buffer and terminate using the
@@ -163,15 +197,14 @@ async def trigger_exports_captured_frame_single_short_test(dut):
         await tb.push_value(sample, last)
     await tb.cycle(tb.dut.dataClk, 1)
 
-    tb.dut.dataRdTrig.value = 1
-    await tb.cycle(tb.dut.dataClk, 1)
-    tb.dut.dataRdTrig.value = 0
+    await tb.data_trigger()
+
     # Frame readout can start immediately but may wait a few cycles until first
     # valid data (tvalid = 1) data available.
-    frame = await with_timeout(tb.sink.recv(), 3, "us")
+    frame = await tb.recv_frame()
     expected = b"".join(sample.to_bytes(2, "little") for sample in samples)
 
-    assert bytes(frame.tdata) == expected
+    assert frame == expected
 
 
 # Generate a frame longer than the buffer to verify automatic frame
@@ -199,13 +232,11 @@ async def trigger_exports_captured_frame_multi_longshort_test(dut):
             assert tb.dut.dataFrameRxDone.value == 1
     await tb.cycle(tb.dut.dataClk, 2)
 
-    tb.dut.dataRdTrig.value = 1
-    await tb.cycle(tb.dut.dataClk, 1)
-    tb.dut.dataRdTrig.value = 0
+    await tb.data_trigger()
 
     # Frame readout can start immediately but may wait a few cycles until first
     # valid data (tvalid = 1) data available.
-    frame_0 = await with_timeout(tb.sink.recv(), 3, "us")
+    frame_0 = await tb.recv_frame()
     if dut.SAFE_BUFFS_G.value:
         # Second frame mid-receive so the read out frame should be the first one,
         # i.e. the first 16 words from the samples list.
@@ -229,12 +260,12 @@ async def trigger_exports_captured_frame_multi_longshort_test(dut):
 
     # Frame readout can start immediately but may wait a few cycles until first
     # valid data (tvalid = 1) data available.
-    frame_1 = await with_timeout(tb.sink.recv(), 3, "us")
+    frame_1 = await tb.recv_frame()
     # Second frame done so now the remaining 8 bytes will be read.
     expected_1 = b"".join(sample.to_bytes(2, "little") for sample in samples[16:])
 
-    assert bytes(frame_0.tdata) == expected_0
-    assert bytes(frame_1.tdata) == expected_1
+    assert frame_0 == expected_0
+    assert frame_1 == expected_1
 
 
 @cocotb.test()
@@ -248,11 +279,11 @@ async def soft_trigger_exports_captured_frame_single_short_test(dut):
         sample = samples[i]
         last = i == len(samples) - 1
         await tb.push_value(sample, last)
+
     await tb.cycle(tb.dut.dataClk, 1)
 
     # Issue software trigger
-    txn = await tb.axil.write(0x8, 0x1.to_bytes(4, "little"))
-    assert txn.resp == AxiResp.OKAY
+    await tb.software_trigger()
 
     # Read register and check that its automatically reset to zero
     txn = await tb.axil.read(0x8, 4)
@@ -261,33 +292,160 @@ async def soft_trigger_exports_captured_frame_single_short_test(dut):
 
     # Frame readout can start immediately but may wait a few cycles until first
     # valid data (tvalid = 1) data available.
-    frame = await with_timeout(tb.sink.recv(), 3, "us")
+    frame = await tb.recv_frame()
     expected = b"".join(sample.to_bytes(2, "little") for sample in samples)
 
-    assert bytes(frame.tdata) == expected
+    assert frame == expected
 
 
+TRIGGER_MODES = [
+    "data",
+    "axil",
+    "software",
+]
+
+
+# General read/write test with segments
+@cocotb.test()
+async def segmented_reads_and_writes_test(dut):
+    tb = TB.from_generics(dut)
+    await tb.reset()
+    tb.start_agents()
+
+    seg_count = 2 ** int(dut.SEGS_ADDR_WIDTH_G.value)
+
+    # Skip if configuration where this test makes no sense
+    if seg_count < 2 or not dut.SEGS_EN_G.value:
+        return
+
+    # Write a unique frame to every segment.
+    expected = {}
+
+    for seg in range(seg_count):
+        samples = [
+            0x1000 + seg * 0x10,
+            0x1001 + seg * 0x10,
+            0x1002 + seg * 0x10,
+        ]
+        expected[seg] = samples
+
+        for i, sample in enumerate(samples):
+            await tb.push_value(sample, last=i == len(samples) - 1, seg=seg)
+
+        await tb.cycle(tb.dut.dataClk, 1)
+
+    # Read every segment using every trigger mechanism.
+    for trigger in TRIGGER_MODES:
+        for seg in range(seg_count):
+
+            if trigger == "data":
+                # TODO: Remove the wait once the data trigger ignored until data process
+                # gets the handshake signal and returns to idle issue is resolved.
+                await tb.cycle(tb.dut.dataClk, 2)
+
+                await tb.data_trigger(seg)
+            elif trigger == "axil":
+                await tb.axil_trigger(seg)
+            elif trigger == "software":
+                await tb.software_trigger(seg)
+
+            frame = await tb.recv_frame()
+
+            expected_bytes = b"".join(sample.to_bytes(2, "little") for sample in expected[seg])
+
+            assert frame == expected_bytes, (
+                f"trigger={trigger}, seg={seg}: " f"got {frame.hex()}, expected {expected_bytes.hex()}"
+            )
+
+
+# Back to back write to different segments
+@cocotb.test()
+async def segmented_read_isolation_test(dut):
+    tb = TB.from_generics(dut)
+    await tb.reset()
+    tb.start_agents()
+
+    seg_count = 2 ** int(dut.SEGS_ADDR_WIDTH_G.value)
+
+    # Skip if configuration where this test makes no sense
+    if seg_count < 2 or not dut.SEGS_EN_G.value:
+        return
+
+    seg0_samples = [0xAAAA, 0xAAAB, 0xAAAC]
+    seg1_samples = [0xBBBB, 0xBBBC, 0xBBBD]
+
+    for i, sample in enumerate(seg0_samples):
+        await tb.push_value(sample, last=i == len(seg0_samples) - 1, seg=0)
+
+    for i, sample in enumerate(seg1_samples):
+        await tb.push_value(sample, last=i == len(seg1_samples) - 1, seg=1)
+
+    # Read from segment 0 which has already completed writing some cycles ago
+    # so we can assert the trigger here immediately.
+    await tb.data_trigger(seg=0)
+
+    frame = await tb.recv_frame()
+
+    expected = b"".join(x.to_bytes(2, "little") for x in seg0_samples)
+
+    assert frame == expected
+
+    # TODO: Remove the wait once the data trigger ignored until data process
+    # gets the handshake signal and returns to idle issue is resolved.
+    await tb.cycle(tb.dut.dataClk, 2)
+
+    await tb.data_trigger(seg=1)
+    frame = await tb.recv_frame()
+
+    expected = b"".join(x.to_bytes(2, "little") for x in seg1_samples)
+
+    assert frame == expected
+
+
+@cocotb.test()
+async def segment_is_latched_for_entire_frame_test(dut):
+    tb = TB.from_generics(dut)
+    await tb.reset()
+    tb.start_agents()
+
+    if not dut.SEGS_EN_G.value:
+        return
+
+    # First sample selects segment 0.
+    await tb.push_value(0x1000, seg=0)
+
+    # These deliberately try to change the segment.
+    await tb.push_value(0x1001, seg=1)
+    await tb.push_value(0x1002, seg=1, last=True)
+
+    await tb.cycle(tb.dut.dataClk, 1)
+
+    await tb.data_trigger(seg=0)
+    frame = await tb.recv_frame()
+
+    expected = b"".join(x.to_bytes(2, "little") for x in [0x1000, 0x1001, 0x1002])
+
+    assert frame == expected
+
+
+# Sweep all combinations of boolean generics for some values of
+# SEGS_ADDR_WIDTH_G specifically inlcuding minimum supported value.
 PARAMETER_SWEEP = [
     parameter_case(
-        "async_clk_capture_safebuf",
-        ASYNC_CLOCKS_G=True,
-        SAFE_BUFFS_G=True,
-    ),
-    parameter_case(
-        "async_clk_capture_unsafebuf",
-        ASYNC_CLOCKS_G=True,
-        SAFE_BUFFS_G=False,
-    ),
-    parameter_case(
-        "sync_clk_capture_safebuf",
-        ASYNC_CLOCKS_G=False,
-        SAFE_BUFFS_G=True,
-    ),
-    parameter_case(
-        "sync_clk_capture_unsafebuf",
-        ASYNC_CLOCKS_G=False,
-        SAFE_BUFFS_G=False,
-    ),
+        f"{'async' if async_clk else 'sync'}_clk_"
+        f"{'safebuf' if safe_buf else 'unsafebuf'}_"
+        f"{'segs' if segs else 'nosegs'}" + (f"_width_{seg_width}" if segs else ""),
+        ASYNC_CLOCKS_G=async_clk,
+        SAFE_BUFFS_G=safe_buf,
+        SEGS_EN_G=segs,
+        SEGS_ADDR_WIDTH_G=seg_width,
+    )
+    for async_clk, safe_buf, segs in product(
+        [True, False],
+        [True, False],
+        [True, False],
+    )
+    for seg_width in ([1, 5] if segs else [1])
 ]
 
 
